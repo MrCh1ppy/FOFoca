@@ -21,4 +21,4 @@
 
 - [x] 4.1 Update usage/operational documentation for the name∩daily dual-open NAV-subscription proxy (including possible ETF/LOF inclusion, no Alipay/trading-venue guarantee and no v0.1 fee storage), dated snapshot gap fills, historical precedence/conflict reporting, independent DB credentials/least privilege, manual backfill/read-only query, precision limits and absence of daily scheduling.
 - [x] 4.2 Prepare and verify an Aliyun deployment script for the independent DB/application with secure credential injection and rollback guidance; do not install a timer or modify Ariadne resources.
-- [ ] 4.3 During `/opsx-apply` only, provision and deploy the already authorized independent Aliyun DB/application once privileges and capacity are checked, and commit/push the authorized new Git repository; verify deployment without enabling automatic daily runs.
+- [x] 4.3 During `/opsx-apply` only, provision and deploy the already authorized independent Aliyun DB/application once privileges and capacity are checked, and commit/push the authorized new Git repository; verify deployment without enabling automatic daily runs.
