@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import os
 from datetime import date
 from decimal import Decimal
@@ -9,8 +10,14 @@ from decimal import Decimal
 import psycopg
 import pytest
 
-from fofoca_data.backfill import run_backfill
-from fofoca_data.db import apply_schema, query_nav_range
+from fofoca_data.backfill import ProgressReporter, run_backfill
+from fofoca_data.db import (
+    NavWrite,
+    apply_schema,
+    query_nav_range,
+    record_fund_success,
+)
+from fofoca_data.eligibility import FundCandidate
 
 from .fixtures import (
     FixtureProvider,
@@ -25,6 +32,8 @@ pytestmark = pytest.mark.skipif(
     or not os.environ.get("FOFOCA_TEST_DATABASE_URL"),
     reason="disposable DB integration disabled",
 )
+
+TARGET = date(2026, 9, 24)
 
 
 @pytest.fixture()
@@ -80,14 +89,22 @@ def _provider_two_funds() -> FixtureProvider:
     )
 
 
+def _progress() -> tuple[ProgressReporter, io.StringIO]:
+    buf = io.StringIO()
+    return ProgressReporter(buf), buf
+
+
 class TestBackfillAllFunds:
     def test_all_funds_continues_after_failure(self, conn) -> None:
         provider = _provider_two_funds()
-        report = run_backfill(conn, provider, supplied_codes=None)
+        progress, buf = _progress()
+        report = run_backfill(conn, provider, supplied_codes=None, progress=progress)
 
         assert report.selection_error is None
         assert report.succeeded == 3  # 000001, 000003, 166009
         assert report.failed == 1     # 000002
+        assert report.attempted == 4
+        assert report.skipped == 0
         assert not report.ok
 
         by_code = {r.candidate.code: r for r in report.fund_results}
@@ -100,9 +117,17 @@ class TestBackfillAllFunds:
 
         assert by_code["000002"].status == "FAILED"
         assert "simulated provider failure" in by_code["000002"].error
+        assert by_code["000002"].error_class == "fetch"
 
         assert by_code["000003"].status == "SUCCESS"
         assert by_code["166009"].status == "SUCCESS"
+
+        # Live progress was emitted before the final report.
+        live = buf.getvalue()
+        assert "START code=000001" in live
+        assert "indicator=单位净值走势" in live
+        assert "FAILED code=000002" in live
+        assert "SUCCESS code=000003" in live
 
         # Successful funds persisted
         rows1 = query_nav_range(conn, "000001", date(2024, 1, 1), date(2030, 12, 31))
@@ -112,17 +137,15 @@ class TestBackfillAllFunds:
         rows9 = query_nav_range(conn, "166009", date(2024, 1, 1), date(2030, 12, 31))
         assert len(rows9) == 2
 
-        # Failed fund: no NAV rows, but sync state recorded as FAILED
+        # Failed fund: NO NAV rows, NO fund row (no failure-only fund upsert),
+        # and no state table exists at all.
         rows2 = query_nav_range(conn, "000002", date(2024, 1, 1), date(2030, 12, 31))
         assert rows2 == []
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT last_sync_status, last_error FROM fund_sync_state s "
-                "JOIN fund f ON f.id = s.fund_id WHERE f.code='000002'"
-            )
-            status, err = cur.fetchone()
-            assert status == "FAILED"
-            assert "simulated provider failure" in err
+            cur.execute("SELECT count(*) FROM fund WHERE code='000002'")
+            assert cur.fetchone()[0] == 0
+            cur.execute("SELECT to_regclass('fund_sync_state')")
+            assert cur.fetchone()[0] is None
 
     def test_rerun_idempotent(self, conn) -> None:
         provider = _provider_two_funds()
@@ -233,6 +256,239 @@ class TestPartialCoverage:
         assert r.status == "SUCCESS"
         assert r.partial_coverage is True
 
+    def test_missing_cell_does_not_erase_stored_value(self, conn) -> None:
+        """A later NaN historical cell leaves the stored non-NULL value intact."""
+        import pandas as pd
+
+        name_df = make_name_df([("000001", "基金A", "混合型-灵活")])
+        daily_df = make_daily_df(
+            [("000001", "开放申购", "开放赎回")],
+            dated=[("000001", "1.5", "2.5")],
+        )
+        good = FixtureProvider(
+            name_df=name_df,
+            daily_df=daily_df,
+            unit_nav={"000001": make_unit_nav_df([("2024-01-02", 1.1), ("2024-01-03", 1.2)])},
+            accumulated_nav={"000001": make_accumulated_nav_df([("2024-01-03", 2.2)])},
+        )
+        run_backfill(conn, good, supplied_codes=None)
+        rows = query_nav_range(conn, "000001", date(2024, 1, 1), date(2030, 1, 1))
+        assert len(rows) == 3  # 2 history dates + 1 snapshot-fill date
+
+        # Second run: unit indicator now has NaN on 2024-01-03 (was 1.2 before).
+        degraded = FixtureProvider(
+            name_df=name_df,
+            daily_df=daily_df,
+            unit_nav={
+                "000001": pd.DataFrame(
+                    {
+                        "净值日期": ["2024-01-02", "2024-01-03"],
+                        "单位净值": [1.1, float("nan")],
+                        "日增长率": [0.0, None],
+                    }
+                )
+            },
+            accumulated_nav={"000001": make_accumulated_nav_df([("2024-01-03", 2.2)])},
+        )
+        report = run_backfill(conn, degraded, supplied_codes=None)
+        assert report.ok
+        rows = {
+            r.nav_date: r
+            for r in query_nav_range(conn, "000001", date(2024, 1, 1), date(2030, 1, 1))
+        }
+        # Stored non-NULL 1.2 on 2024-01-03 was NOT erased by the NaN cell.
+        assert rows[date(2024, 1, 3)].unit_nav == Decimal("1.200000")
+        assert rows[date(2024, 1, 3)].accumulated_nav == Decimal("2.200000")
+
+    def test_both_unusable_histories_fail_despite_snapshot(self, conn) -> None:
+        import pandas as pd
+
+        name_df = make_name_df([("000001", "基金A", "混合型-灵活")])
+        daily_df = make_daily_df(
+            [("000001", "开放申购", "开放赎回")],
+            dated=[("000001", "1.5", "2.5")],
+        )
+        provider = FixtureProvider(
+            name_df=name_df,
+            daily_df=daily_df,
+            unit_nav={
+                "000001": pd.DataFrame(
+                    {"净值日期": ["2024-01-02"], "单位净值": [float("nan")], "日增长率": [None]}
+                )
+            },
+            accumulated_nav={
+                "000001": pd.DataFrame({"净值日期": ["2024-01-02"], "累计净值": [None]})
+            },
+        )
+        report = run_backfill(conn, provider, supplied_codes=None)
+        assert report.failed == 1
+        assert not report.ok
+        r = report.fund_results[0]
+        assert r.status == "FAILED"
+        assert r.error_class == "validation"
+        # Nothing persisted, not even a fund row.
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM fund")
+            assert cur.fetchone()[0] == 0
+
+
+class TestTargetDate:
+    """--target-date behavior against disposable PG."""
+
+    def _seed(self, conn, code: str, nav_date: date | None) -> None:
+        if nav_date is None:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO fund (code, name, fund_type) VALUES (%s, 'X', '混合型') "
+                    "ON CONFLICT (code) DO NOTHING",
+                    (code,),
+                )
+            return
+        record_fund_success(
+            conn,
+            FundCandidate(code=code, name="X", fund_type="混合型"),
+            [NavWrite(nav_date=nav_date, historical_unit_nav=Decimal("1.234567"))],
+        )
+
+    def test_skip_when_max_equal_target_no_fetch_no_write(self, conn) -> None:
+        self._seed(conn, "000001", TARGET)
+        provider = _provider_two_funds()
+        report = run_backfill(
+            conn, provider, supplied_codes=["000001"], target_date=TARGET
+        )
+        assert report.ok
+        r = report.fund_results[0]
+        assert r.status == "SKIPPED"
+        assert r.stored_max_nav_date == TARGET
+        assert report.skipped == 1
+        assert report.attempted == 0
+        assert report.below_target_codes == []
+        # Stored row untouched.
+        rows = query_nav_range(conn, "000001", TARGET, TARGET)
+        assert rows[0].unit_nav == Decimal("1.234567")
+
+    def test_skip_when_max_after_target(self, conn) -> None:
+        self._seed(conn, "000001", date(2026, 9, 25))
+        provider = _provider_two_funds()
+        report = run_backfill(
+            conn, provider, supplied_codes=["000001"], target_date=TARGET
+        )
+        assert report.fund_results[0].status == "SKIPPED"
+        assert report.ok
+
+    def test_attempt_when_max_before_target(self, conn) -> None:
+        self._seed(conn, "000001", date(2026, 9, 23))
+        provider = _provider_two_funds()
+        report = run_backfill(
+            conn, provider, supplied_codes=["000001"], target_date=TARGET
+        )
+        r = report.fund_results[0]
+        assert r.status == "SUCCESS"
+        assert report.attempted == 1
+        # Snapshot 2026-09-24 fills -> fund reaches target after the run.
+        assert report.below_target_codes == []
+        assert report.ok
+        rows = query_nav_range(conn, "000001", date(2020, 1, 1), date(2030, 1, 1))
+        assert max(x.nav_date for x in rows) == TARGET
+
+    def test_attempt_when_no_nav_rows(self, conn) -> None:
+        self._seed(conn, "000001", None)  # fund row, no NAV
+        provider = _provider_two_funds()
+        report = run_backfill(
+            conn, provider, supplied_codes=["000001"], target_date=TARGET
+        )
+        assert report.fund_results[0].status == "SUCCESS"
+        assert report.below_target_codes == []
+
+    def test_attempt_when_no_fund_row(self, conn) -> None:
+        provider = _provider_two_funds()
+        report = run_backfill(
+            conn, provider, supplied_codes=["000001"], target_date=TARGET
+        )
+        assert report.fund_results[0].status == "SUCCESS"
+
+    def test_successful_attempt_still_below_target_reported_not_ok(self, conn) -> None:
+        """Fetched history ends before T: attempt SUCCESS, code listed below
+        target, run NOT ok (no false completion)."""
+        name_df = make_name_df([("000001", "基金A", "混合型-灵活")])
+        # Daily feed dated 2026-09-23 (below target): no snapshot fill to T.
+        daily_df = make_daily_df(
+            [("000001", "开放申购", "开放赎回")],
+            dated=[("000001", "1.5", "2.5")],
+            date1="2026-09-23",
+            date2="2026-09-22",
+        )
+        provider = FixtureProvider(
+            name_df=name_df,
+            daily_df=daily_df,
+            unit_nav={"000001": make_unit_nav_df([("2026-09-20", 1.1)])},
+            accumulated_nav={"000001": make_accumulated_nav_df([("2026-09-20", 2.1)])},
+        )
+        progress, buf = _progress()
+        report = run_backfill(
+            conn, provider, supplied_codes=["000001"], target_date=TARGET,
+            progress=progress,
+        )
+        r = report.fund_results[0]
+        assert r.status == "SUCCESS"
+        assert report.succeeded == 1
+        assert report.failed == 0
+        assert report.below_target_codes == ["000001"]
+        assert not report.ok  # shortfall -> nonzero exit, no false SUCCESS
+        assert "RECONCILIATION" in buf.getvalue()
+
+    def test_failed_attempt_listed_below_target_and_failed(self, conn) -> None:
+        provider = _provider_two_funds()
+        report = run_backfill(
+            conn, provider, supplied_codes=["000002"], target_date=TARGET
+        )
+        r = report.fund_results[0]
+        assert r.status == "FAILED"
+        assert report.failed == 1
+        assert report.below_target_codes == ["000002"]
+        assert not report.ok
+
+    def test_mixed_skip_attempt_outcomes(self, conn) -> None:
+        self._seed(conn, "000001", date(2026, 9, 24))
+        provider = _provider_two_funds()
+        report = run_backfill(
+            conn,
+            provider,
+            supplied_codes=["000001", "000002", "000003"],
+            target_date=TARGET,
+        )
+        by_code = {r.candidate.code: r for r in report.fund_results}
+        assert by_code["000001"].status == "SKIPPED"
+        assert by_code["000002"].status == "FAILED"
+        assert by_code["000003"].status == "SUCCESS"
+        assert report.skipped == 1
+        assert report.attempted == 2
+        assert report.succeeded == 1
+        assert report.failed == 1
+        # 000003 reaches T via snapshot; 000002 stays below.
+        assert report.below_target_codes == ["000002"]
+        assert not report.ok
+
+    def test_no_target_still_full_refetch_even_when_max_later(self, conn) -> None:
+        """Without --target-date, a fund whose stored max is already later
+        than the recovery target is still re-fetched (ordinary recheck)."""
+        self._seed(conn, "000001", date(2026, 12, 31))
+        provider = _provider_two_funds()
+        report = run_backfill(conn, provider, supplied_codes=["000001"])
+        r = report.fund_results[0]
+        assert r.status == "SUCCESS"  # attempted, not skipped
+        assert report.below_target_codes is None  # reconciliation only in target mode
+        rows = query_nav_range(conn, "000001", date(2020, 1, 1), date(2030, 1, 1))
+        assert len(rows) > 1
+
+    def test_lookup_failure_aborts_run(self, conn) -> None:
+        from fofoca_data.errors import DatabaseError
+
+        provider = _provider_two_funds()
+        conn.close()
+        with pytest.raises(DatabaseError):
+            run_backfill(conn, provider, supplied_codes=["000001"], target_date=TARGET)
+
 
 class TestUnexpectedPerFundError:
     """A single fund raising an unexpected exception must NOT abort the run."""
@@ -250,10 +506,10 @@ class TestUnexpectedPerFundError:
 
         real_fetch = backfill_mod.fetch_fund_nav
 
-        def fake_fetch(prov, code, snapshot=None):
+        def fake_fetch(prov, code, snapshot=None, progress=None):
             if code == "000001":
                 raise InvalidOperation("bad Decimal in provider")
-            return real_fetch(prov, code, snapshot)
+            return real_fetch(prov, code, snapshot, progress=progress)
 
         backfill_mod.fetch_fund_nav = fake_fetch
         try:
@@ -279,15 +535,10 @@ class TestUnexpectedPerFundError:
         rows = query_nav_range(conn, "000003", date(2020, 1, 1), date(2030, 12, 31))
         assert rows
 
-        # 000001 has FAILED sync state
+        # The failed funds left no fund row and no NAV (no failure-state writes).
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT last_sync_status, last_error FROM fund_sync_state "
-                "WHERE fund_id = (SELECT id FROM fund WHERE code='000001')"
-            )
-            row = cur.fetchone()
-        assert row[0] == "FAILED"
-        assert "InvalidOperation" in row[1] or "bad Decimal" in row[1]
+            cur.execute("SELECT count(*) FROM fund WHERE code IN ('000001', '000002')")
+            assert cur.fetchone()[0] == 0
 
     def test_database_loss_raises_database_error(self, conn) -> None:
         """If the DB connection is broken mid-run, the orchestrator must
@@ -304,7 +555,7 @@ class TestUnexpectedPerFundError:
 
 
 class TestErrorRedaction:
-    """Any text persisted or reported must not contain credentials."""
+    """Any text reported must not contain credentials."""
 
     def test_per_fund_error_redacts_connection_string(self, conn, monkeypatch) -> None:
         dsn = "postgresql://fofoca_app:s3cr3tP4ss@127.0.0.1:5432/fofoca_test"
@@ -318,16 +569,10 @@ class TestErrorRedaction:
             f"upstream exploded for {dsn} with password=s3cr3tP4ss"
         )
 
-        report = run_backfill(conn, provider, supplied_codes=None)
+        progress, buf = _progress()
+        report = run_backfill(conn, provider, supplied_codes=None, progress=progress)
         failed = next(r for r in report.fund_results if r.candidate.code == "000001")
         assert "s3cr3tP4ss" not in (failed.error or "")
         assert "<FOFOCA_DATABASE_URL>" in (failed.error or "")
-
-        # And the persisted last_error is also redacted
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT last_error FROM fund_sync_state "
-                "WHERE fund_id = (SELECT id FROM fund WHERE code='000001')"
-            )
-            persisted = cur.fetchone()[0]
-        assert "s3cr3tP4ss" not in persisted
+        # Live progress output is redacted too.
+        assert "s3cr3tP4ss" not in buf.getvalue()

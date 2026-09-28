@@ -2,10 +2,12 @@
 
 All writes go through this module. Fund-level atomicity rules (per spec):
 
-  * metadata + NAV upserts + SUCCESS sync state commit in ONE transaction;
-  * on fund failure the data transaction is rolled back; FAILED state is
-    written in a SEPARATE short transaction (so a failed fund does not lose
-    prior coverage), without advancing prior first/last dates;
+  * one fund's metadata + NAV upserts commit in ONE transaction; there is no
+    success/failure state table (removed in v0.2) and no failure-only fund
+    row is ever inserted;
+  * on fund failure the attempt's transaction is rolled back, previously
+    committed funds stay committed, and the failure is reported only through
+    live output and the in-memory run report;
   * full-history non-NULL values upsert (including corrected historical
     values) and may replace a stored non-NULL value;
   * daily-snapshot values may only fill a stored NULL — they never revise a
@@ -20,9 +22,8 @@ in the repository.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date
 from decimal import Decimal
 from importlib import resources
 from typing import Iterable
@@ -31,8 +32,11 @@ import psycopg
 from psycopg import Connection
 
 from .eligibility import FundCandidate
+from .errors import DatabaseError
 from .redact import sanitize_error as _sanitize_error_impl
 
+# Kept for backward compatibility with older imports; the state table itself
+# no longer exists and this constant is no longer used by the write path.
 DATASET_NAV_DAILY = "NAV_DAILY"
 
 
@@ -47,11 +51,78 @@ def _load_schema_sql() -> str:
 
 
 def apply_schema(conn: Connection) -> None:
-    """Create the three fofoca tables if they do not exist (idempotent)."""
+    """Create the two fofoca tables if they do not exist (idempotent).
+
+    Never drops or recreates anything. Never creates the removed
+    ``fund_sync_state`` table. Safe to run repeatedly against a database that
+    already holds fund/NAV data.
+    """
     sql = _load_schema_sql()
     with conn.cursor() as cur:
         cur.execute(sql)
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Stored-coverage reads (target-date support)
+# ---------------------------------------------------------------------------
+
+
+def read_stored_max_nav_dates(
+    conn: Connection, codes: Iterable[str]
+) -> dict[str, date | None]:
+    """Return ``{code: stored MAX(nav_date) or None}`` for each supplied code.
+
+    ``None`` covers both "no fund row" and "fund row but no NAV rows" — both
+    mean "no stored coverage" for the target-date skip heuristic.
+
+    This function runs in its own short read-only transaction and leaves the
+    connection clean (committed, not idle-in-transaction) so callers can
+    perform network I/O immediately afterwards without holding a database
+    transaction open.
+
+    Raises ``DatabaseError`` on any lookup failure — a failed lookup must
+    never be treated as "no stored coverage".
+    """
+    code_list = sorted(set(codes))
+    if not code_list:
+        return {}
+    try:
+        with conn.transaction():
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT f.code, MAX(n.nav_date) "
+                    "FROM fund f LEFT JOIN fund_nav_daily n ON n.fund_id = f.id "
+                    "WHERE f.code = ANY(%(codes)s) "
+                    "GROUP BY f.code",
+                    {"codes": code_list},
+                )
+                found = {row[0]: row[1] for row in cur.fetchall()}
+    except (psycopg.OperationalError, psycopg.InterfaceError) as exc:
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001 — connection may already be dead
+            pass
+        raise DatabaseError(
+            f"could not read stored NAV coverage: {_sanitize_error_impl(exc)}"
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        try:
+            conn.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        raise DatabaseError(
+            f"could not read stored NAV coverage: {_sanitize_error_impl(exc)}"
+        ) from exc
+    return {code: found.get(code) for code in code_list}
+
+
+def stored_max_nav_date(conn: Connection, code: str) -> date | None:
+    """Single-code convenience wrapper around :func:`read_stored_max_nav_dates`.
+
+    Uses the same short-transaction semantics and failure policy.
+    """
+    return read_stored_max_nav_dates(conn, [code])[code]
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +139,20 @@ class NavWrite:
     historical_accumulated_nav: Decimal | None = None
     snapshot_unit_nav: Decimal | None = None
     snapshot_accumulated_nav: Decimal | None = None
+
+    @property
+    def has_any_value(self) -> bool:
+        """True when any (historical or usable snapshot) metric is present.
+
+        Dates with no usable historical metric and no valid dated snapshot
+        fill must not be inserted; callers filter on this before writing.
+        """
+        return (
+            self.historical_unit_nav is not None
+            or self.historical_accumulated_nav is not None
+            or self.snapshot_unit_nav is not None
+            or self.snapshot_accumulated_nav is not None
+        )
 
 
 @dataclass(frozen=True)
@@ -120,38 +205,6 @@ FROM fund_nav_daily
 WHERE fund_id = %(fund_id)s
 """
 
-_UPSERT_SUCCESS_STATE_SQL = """
-INSERT INTO fund_sync_state (
-    fund_id, dataset, first_data_date, last_data_date,
-    last_sync_at, last_sync_status, last_error
-) VALUES (
-    %(fund_id)s, %(dataset)s, %(first)s, %(last)s,
-    %(sync_at)s, 'SUCCESS', NULL
-)
-ON CONFLICT (fund_id, dataset) DO UPDATE
-    SET first_data_date = EXCLUDED.first_data_date,
-        last_data_date = EXCLUDED.last_data_date,
-        last_sync_at = EXCLUDED.last_sync_at,
-        last_sync_status = 'SUCCESS',
-        last_error = NULL,
-        updated_at = now()
-"""
-
-_UPSERT_FAILED_STATE_SQL = """
-INSERT INTO fund_sync_state (
-    fund_id, dataset, first_data_date, last_data_date,
-    last_sync_at, last_sync_status, last_error
-) VALUES (
-    %(fund_id)s, %(dataset)s, NULL, NULL,
-    %(sync_at)s, 'FAILED', %(error)s
-)
-ON CONFLICT (fund_id, dataset) DO UPDATE
-    SET last_sync_at = EXCLUDED.last_sync_at,
-        last_sync_status = 'FAILED',
-        last_error = EXCLUDED.last_error,
-        updated_at = now()
-"""
-
 
 def _sanitize_error(message: str, *, max_len: int = 500) -> str:
     """Backward-compatible shim — delegates to ``redact.sanitize_error``."""
@@ -164,11 +217,14 @@ def record_fund_success(
     writes: Iterable[NavWrite],
     *,
     established_date: date | None = None,
-    sync_at: datetime | None = None,
 ) -> FundWriteOutcome:
-    """Commit one fund's metadata + NAV upserts + SUCCESS state atomically."""
-    sync_at = sync_at or datetime.now(tz=timezone.utc)
-    writes_list = list(writes)
+    """Commit one fund's metadata + NAV upserts atomically.
+
+    Writes with no usable value on any metric are skipped here as a final
+    safety net (orchestration already filters them), so an all-NULL row can
+    never be inserted.
+    """
+    writes_list = [w for w in writes if w.has_any_value]
     with conn.transaction():
         with conn.cursor() as cur:
             cur.execute(
@@ -180,7 +236,10 @@ def record_fund_success(
                     "established_date": established_date,
                 },
             )
-            fund_id = int(cur.fetchone()[0])
+            fund_row = cur.fetchone()
+            if fund_row is None:  # pragma: no cover - defensive
+                raise DatabaseError("fund upsert returned no id")
+            fund_id = int(fund_row[0])
 
             for w in writes_list:
                 cur.execute(
@@ -197,65 +256,17 @@ def record_fund_success(
 
             cur.execute(_SELECT_COVERAGE_SQL, {"fund_id": fund_id})
             row = cur.fetchone()
+            if row is None:  # pragma: no cover - defensive
+                raise DatabaseError("coverage lookup returned no row")
             first_d: date | None = row[0]
             last_d: date | None = row[1]
             stored_rows: int = int(row[2])
-
-            cur.execute(
-                _UPSERT_SUCCESS_STATE_SQL,
-                {
-                    "fund_id": fund_id,
-                    "dataset": DATASET_NAV_DAILY,
-                    "first": first_d,
-                    "last": last_d,
-                    "sync_at": sync_at,
-                },
-            )
     return FundWriteOutcome(
         fund_id=fund_id,
         stored_rows=stored_rows,
         first_data_date=first_d,
         last_data_date=last_d,
     )
-
-
-def record_fund_failure(
-    conn: Connection,
-    candidate: FundCandidate,
-    error: BaseException | str,
-    *,
-    sync_at: datetime | None = None,
-) -> int:
-    """Record a FAILED attempt in a separate short transaction.
-
-    The fund row is upserted (so the FK target exists) but NAV data is not
-    touched, and prior first/last dates are preserved by the ON CONFLICT
-    clause. Returns the fund id.
-    """
-    sync_at = sync_at or datetime.now(tz=timezone.utc)
-    error_text = _sanitize_error(str(error))
-    with conn.transaction():
-        with conn.cursor() as cur:
-            cur.execute(
-                _UPSERT_FUND_SQL,
-                {
-                    "code": candidate.code,
-                    "name": candidate.name,
-                    "fund_type": candidate.fund_type,
-                    "established_date": None,
-                },
-            )
-            fund_id = int(cur.fetchone()[0])
-            cur.execute(
-                _UPSERT_FAILED_STATE_SQL,
-                {
-                    "fund_id": fund_id,
-                    "dataset": DATASET_NAV_DAILY,
-                    "sync_at": sync_at,
-                    "error": error_text,
-                },
-            )
-    return fund_id
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +317,7 @@ __all__ = [
     "StoredNavRow",
     "apply_schema",
     "record_fund_success",
-    "record_fund_failure",
+    "read_stored_max_nav_dates",
+    "stored_max_nav_date",
     "query_nav_range",
 ]

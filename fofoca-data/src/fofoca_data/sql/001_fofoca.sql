@@ -1,6 +1,13 @@
--- fofoca-data v0.1 schema
+-- fofoca-data v0.2 schema (two tables: fund, fund_nav_daily)
 -- Dedicated PostgreSQL database. NEVER run this against Ariadne's database.
 -- The role executing this file must own the resulting tables.
+--
+-- The legacy fund_sync_state table was removed in v0.2. This script never
+-- drops anything; removing the old table from an existing deployment is a
+-- separate, explicit, backup-verified operator migration (see
+-- fofoca_data.migration / deploy/README.md). Repeat initialization is safe:
+-- it creates the two retained tables if missing and does not recreate the
+-- removed one.
 
 BEGIN;
 
@@ -23,19 +30,6 @@ CREATE TABLE IF NOT EXISTS fund_nav_daily (
     created_at       TIMESTAMPTZ   NOT NULL DEFAULT now(),
     updated_at       TIMESTAMPTZ   NOT NULL DEFAULT now(),
     PRIMARY KEY (fund_id, nav_date)
-);
-
-CREATE TABLE IF NOT EXISTS fund_sync_state (
-    fund_id          BIGINT       NOT NULL REFERENCES fund(id),
-    dataset          VARCHAR(32)  NOT NULL,
-    first_data_date  DATE         NULL,
-    last_data_date   DATE         NULL,
-    last_sync_at     TIMESTAMPTZ  NULL,
-    last_sync_status VARCHAR(16)  NOT NULL,
-    last_error       TEXT         NULL,
-    created_at       TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    updated_at       TIMESTAMPTZ  NOT NULL DEFAULT now(),
-    PRIMARY KEY (fund_id, dataset)
 );
 
 COMMIT;

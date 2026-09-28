@@ -8,16 +8,24 @@ History semantics (per spec):
     that history left empty;
   * a non-NULL historical value always wins over a snapshot value for the
     same date/metric; the disagreement is reported, not silently overwritten;
-  * a failed history request, malformed nonempty history, or two valid empty
-    indicators fails the fund even if snapshot values exist;
-  * one valid empty indicator + one nonempty indicator records SUCCESS with
-    ``partial_historical_coverage=True``;
+  * genuinely missing historical cells (``None`` / ``NaN``) are treated as
+    absent on otherwise valid rows — dates are still validated and duplicate
+    dates still fail; malformed/blank-string, infinite, non-positive or
+    overflowing **present** values fail the fund;
+  * a failed history request or a response with no usable NAV on **both**
+    indicators fails the fund even if snapshot values exist; if only one
+    indicator has usable NAV the fund reports partial coverage;
+  * a (date, metric) slot with no usable historical value and no valid dated
+    snapshot fill yields no stored value for that slot — missing metrics
+    never erase stored non-NULL values;
   * malformed dated snapshot columns or invalid present snapshot NAV values
     fail the fund (fail-closed).
 """
 
 from __future__ import annotations
 
+import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
@@ -36,6 +44,8 @@ _UNIT_DATE_COL = "净值日期"
 _UNIT_VALUE_COL = "单位净值"
 _ACC_DATE_COL = "净值日期"
 _ACC_VALUE_COL = "累计净值"
+
+ProgressCallback = Callable[[str], None]
 
 
 @dataclass
@@ -106,10 +116,14 @@ def _series_from_indicator(
     value_col: str,
     label: str,
 ) -> dict[date, Decimal]:
-    """Normalize one indicator DataFrame into ``{date: Decimal}``.
+    """Normalize one indicator DataFrame into ``{date: Decimal}`` of usable NAVs.
 
-    ``df`` may be empty. If nonempty, required columns must be present and
-    every row must parse. Any duplicate date fails closed.
+    ``df`` may be empty or ``None``-valued in the value column. Genuinely
+    missing cells (``None`` / pandas ``NaN``) are treated as absent: their
+    dates are still parsed and validated, and duplicate dates still fail
+    closed, but they contribute no value. Present values must parse and pass
+    the full NAV policy (finite, positive, in range). Any duplicate date
+    (even on missing-value rows) fails closed.
     """
     if df is None:
         raise NavDataError(f"{label}: provider returned None")
@@ -121,10 +135,26 @@ def _series_from_indicator(
             f"{label}: required column(s) missing: {missing!r}; got {list(df.columns)!r}"
         )
     out: dict[date, Decimal] = {}
+    seen: set[date] = set()
     for _, row in df.iterrows():
         try:
             nav_date = parse_nav_date(row[date_col])
-            value = nav_to_decimal(row[value_col])
+        except NavDataError:
+            raise
+        except Exception as exc:
+            raise NavDataError(
+                f"{label}: row date could not be parsed "
+                f"({type(exc).__name__}: {exc})"
+            ) from exc
+        if nav_date in seen:
+            raise NavDataError(f"{label}: duplicate date {nav_date.isoformat()}")
+        seen.add(nav_date)
+        raw_value = row[value_col]
+        if raw_value is None or (isinstance(raw_value, float) and math.isnan(raw_value)):
+            # Genuinely missing cell: date validated above, no value stored.
+            continue
+        try:
+            out[nav_date] = nav_to_decimal(raw_value)
         except NavDataError:
             raise
         except Exception as exc:
@@ -133,9 +163,6 @@ def _series_from_indicator(
                 f"{label}: row could not be parsed "
                 f"({type(exc).__name__}: {exc})"
             ) from exc
-        if nav_date in out:
-            raise NavDataError(f"{label}: duplicate date {nav_date.isoformat()}")
-        out[nav_date] = value
     return out
 
 
@@ -193,14 +220,19 @@ def fetch_fund_nav(
     provider: Provider,
     code: str,
     snapshot: DailySnapshot | None = None,
+    progress: ProgressCallback | None = None,
 ) -> FundNavFetch:
     """Fetch both history indicators for ``code`` and reconcile with the snapshot.
 
     Raises ``NavDataError`` on history request failure, malformed nonempty
-    history, both history indicators valid but empty, or an invalid snapshot
-    value for a (date, metric) the snapshot actually exposes for this fund.
+    history, both history indicators having no usable NAV, or an invalid
+    snapshot value for a (date, metric) the snapshot actually exposes for
+    this fund. ``progress``, when given, is invoked with the indicator label
+    immediately before each request so callers can log per-stage timing.
     """
+    _notify = progress if progress is not None else lambda _label: None
     try:
+        _notify(UNIT_INDICATOR)
         unit_df = provider.fund_open_fund_info_em(code, UNIT_INDICATOR)
     except NavDataError:
         raise
@@ -209,6 +241,7 @@ def fetch_fund_nav(
         # per-fund failure, not a run-crash.
         raise NavDataError(f"{code}: 单位净值走势 request failed: {exc}") from exc
     try:
+        _notify(ACCUMULATED_INDICATOR)
         acc_df = provider.fund_open_fund_info_em(code, ACCUMULATED_INDICATOR)
     except NavDataError:
         raise
@@ -225,7 +258,9 @@ def fetch_fund_nav(
     unit_empty = len(unit) == 0
     acc_empty = len(accumulated) == 0
     if unit_empty and acc_empty:
-        raise NavDataError(f"{code}: both NAV indicators returned empty results")
+        raise NavDataError(
+            f"{code}: both NAV indicators returned no usable historical NAV values"
+        )
 
     all_dates = sorted(set(unit) | set(accumulated))
     historical_points = [

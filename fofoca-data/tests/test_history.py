@@ -200,8 +200,49 @@ class TestHistoryValidation:
         with pytest.raises(NavDataError):
             fetch_fund_nav(provider, "000001")
 
+    def test_malformed_date_rejected_even_when_value_missing(self) -> None:
+        """Dates are validated on missing-value rows too."""
+        import pandas as pd
+
+        bad = pd.DataFrame(
+            {"净值日期": ["not-a-date"], "单位净值": [None], "日增长率": [None]}
+        )
+        provider = _provider(bad, make_accumulated_nav_df([("2024-01-04", 2.3)]))
+        with pytest.raises(NavDataError):
+            fetch_fund_nav(provider, "000001")
+
+    def test_duplicate_date_rejected_even_when_values_missing(self) -> None:
+        import pandas as pd
+
+        dup = pd.DataFrame(
+            {
+                "净值日期": ["2024-01-02", "2024-01-02"],
+                "单位净值": [float("nan"), 1.1],
+                "日增长率": [None, 0.0],
+            }
+        )
+        provider = _provider(dup, make_accumulated_nav_df([("2024-01-04", 2.3)]))
+        with pytest.raises(NavDataError):
+            fetch_fund_nav(provider, "000001")
+
     def test_nonpositive_history_nav_rejected(self) -> None:
         bad = make_unit_nav_df([("2024-01-02", 0.0)])
+        provider = _provider(bad, make_accumulated_nav_df([("2024-01-04", 2.3)]))
+        with pytest.raises(NavDataError):
+            fetch_fund_nav(provider, "000001")
+
+    def test_infinite_history_nav_rejected(self) -> None:
+        bad = make_unit_nav_df([("2024-01-02", float("inf"))])
+        provider = _provider(bad, make_accumulated_nav_df([("2024-01-04", 2.3)]))
+        with pytest.raises(NavDataError):
+            fetch_fund_nav(provider, "000001")
+
+    def test_blank_string_history_nav_rejected(self) -> None:
+        import pandas as pd
+
+        bad = pd.DataFrame(
+            {"净值日期": ["2024-01-02"], "单位净值": ["  "], "日增长率": [0.0]}
+        )
         provider = _provider(bad, make_accumulated_nav_df([("2024-01-04", 2.3)]))
         with pytest.raises(NavDataError):
             fetch_fund_nav(provider, "000001")
@@ -221,3 +262,74 @@ class TestHistoryValidation:
         p = result.historical_points[0]
         assert p.unit_nav == Decimal("1.234568")
         assert p.accumulated_nav == Decimal("2.000001")
+
+
+class TestMissingHistoricalCells:
+    """Actual None/NaN historical cells are absent, not errors (per change)."""
+
+    def test_nan_unit_cell_absent_other_metric_usable(self) -> None:
+        import pandas as pd
+
+        unit = pd.DataFrame(
+            {
+                "净值日期": ["2024-01-02", "2024-01-03"],
+                "单位净值": [float("nan"), 1.2],
+                "日增长率": [None, 0.1],
+            }
+        )
+        acc = make_accumulated_nav_df([("2024-01-02", 2.2), ("2024-01-03", 2.3)])
+        result = fetch_fund_nav(_provider(unit, acc), "000001")
+        by_date = {p.nav_date: p for p in result.historical_points}
+        assert by_date[date(2024, 1, 2)].unit_nav is None
+        assert by_date[date(2024, 1, 2)].accumulated_nav == Decimal("2.200000")
+        assert by_date[date(2024, 1, 3)].unit_nav == Decimal("1.200000")
+        assert not result.partial_coverage  # both indicators have usable values
+
+    def test_none_cell_absent(self) -> None:
+        import pandas as pd
+
+        unit = pd.DataFrame(
+            {
+                "净值日期": ["2024-01-02"],
+                "单位净值": [None],
+                "日增长率": [None],
+            }
+        )
+        acc = make_accumulated_nav_df([("2024-01-02", 2.2)])
+        result = fetch_fund_nav(_provider(unit, acc), "000001")
+        # unit indicator has NO usable values -> partial coverage
+        assert result.partial_coverage
+        assert result.unit_indicator_empty
+        p = result.historical_points[0]
+        assert p.unit_nav is None
+        assert p.accumulated_nav == Decimal("2.200000")
+
+    def test_all_nan_indicator_counts_as_no_usable_values(self) -> None:
+        import pandas as pd
+
+        unit = pd.DataFrame(
+            {
+                "净值日期": ["2024-01-02", "2024-01-03"],
+                "单位净值": [float("nan"), float("nan")],
+                "日增长率": [None, None],
+            }
+        )
+        acc = make_accumulated_nav_df([("2024-01-02", 2.2)])
+        result = fetch_fund_nav(_provider(unit, acc), "000001")
+        assert result.partial_coverage
+        assert result.unit_indicator_empty
+        assert not result.accumulated_indicator_empty
+
+    def test_both_indicators_only_missing_cells_fail_even_with_snapshot(self) -> None:
+        import pandas as pd
+
+        unit = pd.DataFrame(
+            {"净值日期": ["2024-01-02"], "单位净值": [float("nan")], "日增长率": [None]}
+        )
+        acc = pd.DataFrame({"净值日期": ["2024-01-02"], "累计净值": [None]})
+        snapshot = _snapshot_for(
+            [("000001", "开放申购", "开放赎回")],
+            dated=[("000001", "1.5", "1.6")],
+        )
+        with pytest.raises(NavDataError):
+            fetch_fund_nav(_provider(unit, acc), "000001", snapshot)
