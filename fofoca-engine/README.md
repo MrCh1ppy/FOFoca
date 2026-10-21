@@ -1,4 +1,4 @@
-# fofoca-engine (binding skeleton)
+# fofoca-engine (initialization and stateless settlement-core stage)
 
 Independent edition-2024 Rust library with a **PyO3 extension and thin typed Python
 facade** as the Python entry point. No binary, CLI, async runtime, HTTP, SQLite, persistence, data fetching,
@@ -8,38 +8,85 @@ compose data/report components without Python or a subprocess.
 
 ## Current scope (not a complete backtest engine)
 
-`BacktestSession()` constructs a distinct native, empty session. `initialize`
-accepts `datetime.date`, `datetime.date`, and decimal **str**, but always raises
-`NotImplementedError`; it does not retain configuration. `account`, `set_orders`,
-`advance_day`, and `report` raise `fofoca_engine.NotInitializedError` (a native
-module exception derived from `RuntimeError`). Reports never fabricate success.
-No second Python state, JSON round trip, subprocess, or Tokio runtime is involved.
+`BacktestSession()` constructs a distinct uninitialized native session.
+`initialize(start_date, end_date, initial_cash)` opens an empty cash-only account
+once. Dates must be `datetime.date` (not `datetime.datetime` or strings), in years
+1–9999, with start <= end; both endpoints are inclusive, including a one-day
+range or 9999-12-31. Initialization does not calculate a future D+1 date.
+Invalid attempts create no state; repeated successful initialization cannot reset it.
 
-The Python wrapper provides inline typing, `Order`/`Market` TypedDicts, a private
-extension stub, and `py.typed`. Native checks currently cover argument count and
-outer input types only. Nested order/market and business date/code/decimal
-semantics, precision, successful account initialization, trading, settlement,
-valuation, and report output remain unimplemented. Return annotations are `None`
-for this rejecting skeleton, not a promise about future account/report types.
-Float input is unsupported; no float precision contract is made. Typed Rust
-domain configuration/output types will be introduced with their business phase,
-not invented as Python objects or wire JSON in the core. The current core
-`Session::initialize()` is deliberately argument-free and always rejects.
+Cash accepts only strings matching `(?:0|[1-9][0-9]*)(?:\.[0-9]+)?` with at most
+12 supplied fractional digits (trailing zeros count). No sign, whitespace,
+Unicode digits, leading zeros, exponent, float, int, or Python Decimal is accepted.
+Money is nonnegative. Core `Shares` supports zero internal positions and a positive
+input parser; `Nav` is positive. Both use at most six fractional digits.
+All values must fit a 96-bit coefficient **at their fixed output scale**; the
+largest money is `79228162514264337.593543950335`, and the largest shares/NAV is
+`79228162514264337593543.950335`. Checked sums, nonnegative subtraction, and
+shares * NAV use integer coefficient checks, never implicit decimal rescaling.
+For example `0.123456 * 1.234567 = 0.152414703552` exactly. Overflow rejects,
+not rounds; money/shares output always has 12/6 places and unsigned zero.
+
+The Rust core also has a stateless single-day settlement helper,
+`settlement::settle(opening: &Account, current_date, unit_nav, orders)`, with typed
+`Order`/`Side` inputs. It derives checked buy-minus-sell nets by code (zero =
+`no_trade`), skips non-zero nets without today's NAV before any sufficiency check,
+checks sells against opening confirmed shares, and checks the aggregate buy cost
+once against opening cash without recycling sale proceeds. Any issue returns a
+structured rejection containing the original orders, derived nets, provisional
+skips, and collected issues while leaving the opening account untouched. A
+successful candidate applies only that day's trade changes: buys deduct cash and
+create D+1 pending shares, sells deduct confirmed shares and create D+1 pending
+cash, and the candidate is revalued exactly with a checked component/total
+partition. D+1 outside business years 1–9999 rejects. There is no f64 or rounding.
+This helper is **not exposed through Python and not committed by `Session`**;
+price pinning, order replacement, next-opening arrivals, records, reports, and
+daily advancement remain later work.
+
+`account() -> Snapshot` returns an independent nested Python dict/list projection,
+not a JSON envelope. Its exact top-level keys are `status`, `start_date`, `end_date`,
+`current_date`, `last_closed_date`, `snapshot_pinned`, `orders`, `account`.
+At this stage status is `running`, current_date is start_date, last_closed_date is
+None, snapshot_pinned is False, and orders is empty. The nested `Account` has
+`valuation_date` (start_date), `cash`, `holdings`, `pending_buys`, `pending_cash`,
+`confirmed_value`, `pending_buy_value`, `pending_cash_value`, `total_assets`.
+All lists are empty, component values are `0.000000000000`, and total_assets equals
+cash. All dates are `datetime.date`, all money values are fixed12 strings.
+Modifying any returned object cannot change the native session.
+
+Wrong input types raise TypeError; date ranges, decimal grammar/scale raise
+ValueError; coefficient/arithmetic overflow raises OverflowError. Native
+`NotInitializedError` and `AlreadyInitializedError` both derive from RuntimeError.
+Before initialization account/order/day/report calls raise NotInitializedError.
+After initialization, account succeeds but `set_orders`, `advance_day`, and `report`
+still raise NotImplementedError, never return fake success. Python nested order/market
+validation, Session order/day wiring, committed daily settlement and arrivals,
+price pinning caches, records, and JSON report generation are not implemented.
+The Rust stateless settlement helper above is not yet reachable from Python.
+
+The thin wrapper exports Snapshot/Account/Holding/PendingBuy/PendingCash TypedDicts,
+Order/Market shapes, exceptions, a private native stub, and `py.typed`. It retains
+only the native handle: no Python ledger, JSON round trip, subprocess, or Tokio.
 
 ```python
 from datetime import date
-from fofoca_engine import BacktestSession, NotInitializedError
+from fofoca_engine import BacktestSession
 
 session = BacktestSession()
-try:
-    session.initialize(date(2026, 1, 1), date(2026, 1, 3), "100")
-except NotImplementedError:
-    pass  # Expected: no account was created.
-try:
-    session.account()
-except NotInitializedError:
-    pass
+session.initialize(date(2026, 1, 1), date(2026, 1, 3), "100")
+snapshot = session.account()
+assert snapshot["account"]["total_assets"] == "100.000000000000"
+snapshot["account"]["cash"] = "0"  # Detached copy, not a transaction.
+assert session.account()["account"]["cash"] == "100.000000000000"
 ```
+
+Rust callers use `Config::parse(NaiveDate, NaiveDate, &str)` (or `Config::new`
+with `Money`), `Session::default()`, `Session::initialize(config)`, and
+`Session::account() -> Result<Snapshot, SessionError>`. Config is validated and
+private with getters; session state is private. Owned snapshots may be changed by
+the caller without changing the ledger. The public `decimal` and `model` modules
+provide bounded financial values and owned confirmed/pending component structures,
+but no transaction mutation API. Core types depend on neither PyO3 nor serde/JSON.
 
 ## Packaging and real-wheel validation (repository root)
 
@@ -70,8 +117,9 @@ python3.12 -m venv /tmp/opencode/fofoca-engine-test-312
 ```
 
 The installed-wheel suite checks native import, independent objects, actual
-exceptions and type failures, typing artifacts, repeated failed initialization,
-and every exposed business operation. An audit hook rejects child-process
+exceptions and type failures, typing artifacts, exact snapshot shape, decimal/date
+bounds, invalid-then-valid and repeated initialization, detached nested copies,
+and explicitly unimplemented trading/report methods. An audit hook rejects child-process
 operations before import and PATH is empty throughout. No test replaces the
 extension or engine with mocks. The wheel contains `fofoca_engine._native` and
 `python/fofoca_engine/`. Historical note: an earlier cp314 wheel was built and
@@ -91,10 +139,11 @@ cp312 wheel imports under 3.14.
   Python-feature cargo test with `unable to find library -lpython3.14`, although its
   wheel built and imported successfully.
 - There is no `cli` feature, binary target, JSON Lines transport, or Tokio dependency.
-- SNAFU errors belong to their actual modules (currently `session`). The Python
+- SNAFU errors belong to their actual modules (`decimal`, `model`, `session`). The Python
   adapter only converts errors to Python exceptions; it needs no error enum.
-- Chrono and rust_decimal remain the date/exact-arithmetic dependencies for later
-  authorized business work; the documentation-only domain modules do no work yet.
+- Chrono and rust_decimal back validated dates and exact fixed-scale values.
+  The `settlement` module is a stateless Rust candidate helper with no Session
+  commit; `report` remains documentation-only and Session owns state.
 
 ```sh
 cargo fmt --check --manifest-path fofoca-engine/Cargo.toml
@@ -110,7 +159,10 @@ Historical note: the former JSON Lines CLI and its process tests were removed;
 their earlier passing results are not current validation. Python object disposal
 discards memory without automatic close, settlement, export, or recovery.
 
-Business rules in OpenSpec remain the later target: exact bounded decimals,
-natural-day D+1 settlement, no fees/distributions, trusted-author data/strategy,
-fixed candidate versus committed market, stale valuation, and terminal pending
-assets retained without liquidation. None is claimed implemented here.
+Remaining business rules in OpenSpec are the later target: Session-committed
+natural-day D+1 settlement and arrivals, no fees/distributions, trusted-author
+data/strategy, fixed candidate versus committed market, stale valuation, and
+terminal pending assets retained without liquidation. The stateless settlement
+core already computes D+1 pending candidates and stale revaluation, but it does
+not advance, arrive, pin, record, or commit. This stage does not implement the
+remaining rules or apply the full change.

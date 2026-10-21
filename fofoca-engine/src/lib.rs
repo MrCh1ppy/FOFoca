@@ -1,11 +1,11 @@
-//! Local, synchronous, memory-only backtest skeleton. No business implementation yet.
+//! Local, synchronous, memory-only initialization, exact numeric types, and stateless settlement.
 
-mod decimal;
-mod model;
+pub mod decimal;
+pub mod model;
 #[cfg(feature = "python")]
 mod python;
 mod report;
 mod session;
-mod settlement;
+pub mod settlement;
 
-pub use session::{Session, SessionError};
+pub use session::{Config, ConfigError, Session, SessionError, Snapshot, Status};

@@ -1,9 +1,13 @@
 ## ADDED Requirements
 
-Adapter-stage note: PyO3/typed Python construction currently creates only an empty Rust Session; initialize rejects and never creates an account. Default Rust library builds need no Python or wire/JSON types. The Python extension uses the synchronous core; there is no binary, CLI, async runtime, or duplicate Python ledger. All business requirements below remain unimplemented. Decimal-string grammars below describe external input/export contracts, not a requirement that the core store JSON or Python objects; future domain types remain strongly typed Rust values.
+Initialization-stage note: construction creates an uninitialized Rust Session; validated typed configuration now opens a cash-only empty account once. Bounded nonnegative Money/Shares, positive Nav, Code, owned confirmed/pending component structures, and detached Snapshot/Account projections are implemented. Default Rust builds need no Python or wire/JSON types. There is no binary, CLI, async runtime, or duplicate Python ledger. Decimal-string grammars describe external inputs/exports, not core JSON/Python storage; core inputs/outputs are strongly typed Rust values. This stage is not a full implementation of every scenario below.
+
+Stateless-settlement-stage note: the Rust core now computes one day's candidate from an opening Account, current date, typed optional unit-NAV map, and typed orders. Implemented pieces are original-order-preserving checked buy-minus-sell netting with zero = no_trade, missing-NAV skips before sufficiency checks, opening-confirmed oversell checks, one aggregate opening-cash buy-cost check without sale-proceeds recycling, D+1 pending components/rejection, and exact candidate valuation and total partition. The function returns structured candidate or rejection data and never mutates the opening account. Session does not commit the candidate; set_orders/advance_day, market pinning/conflict, next-opening arrivals, daily records, reports, and Python business methods remain unimplemented. Opening components always carry a stored NAV, so the missing-pricing valuation_unavailable path is not reachable in this model and is not claimed. The requirements below remain the full target.
 
 ### Requirement: Single initialized calendar session
 The engine SHALL own one in-memory account with inclusive, fixed `start_date` and `end_date`, `end_date >= start_date`, nonnegative initial cash, and empty confirmed/pending holdings. Binding dates SHALL be datetime.date values in years 0001–9999, encoded exactly `YYYY-MM-DD` in report exports; fund codes SHALL be six ASCII digits. Invalid initialization SHALL leave the session uninitialized, and successful initialization SHALL open start_date exactly once. Repeated initialization SHALL be rejected without mutation. Python SHALL own all strategy decisions and data preparation; the engine SHALL neither fetch data nor impose a D-1 information restriction.
+
+Core Config SHALL validate NaiveDate years 1..9999 and inclusive ordering before Session::initialize(config) can commit state; fields SHALL be private with getters. Session state SHALL remain private. account SHALL return an owned detached strongly typed Snapshot, never a mutable ledger reference. This initialization stage SHALL NOT pin a market, calculate a D+1 due date, fabricate history, or perform daily settlement.
 
 #### Scenario: Invalid then valid initialization
 - **WHEN** initialize supplies a reversed range or negative initial cash, followed by a valid initialize
@@ -13,8 +17,14 @@ The engine SHALL own one in-memory account with inclusive, fixed `start_date` an
 - **WHEN** initialize is called after a successful initialize
 - **THEN** it returns `already_initialized` without resetting balances, dates, or records
 
+#### Scenario: Inclusive date and snapshot boundaries
+- **WHEN** a one-day session is initialized on 0001-01-01 or 9999-12-31 and two account snapshots are requested
+- **THEN** initialization succeeds without checking a future due date, both snapshots have the start date and cash-only assets, and modifying a detached snapshot cannot alter the session or another session
+
 ### Requirement: Exact decimal arithmetic
 The engine SHALL accept decimal inputs only as strings matching `(?:0|[1-9][0-9]*)(?:\.[0-9]+)?`. Order shares and non-None unit NAV SHALL be positive with at most six supplied fractional digits; initial cash SHALL be nonnegative with at most twelve. Numeric objects, signs, exponent notation, leading zeros, nonfinite values, and excess scale including trailing zeros SHALL be rejected. Every parse, normalization, signed net sum, product, subtraction, aggregate sum, valuation, and output conversion SHALL be checked for exact representation within the `rust_decimal` 96-bit coefficient/scale bound and the field scale. Arithmetic requiring rounding or overflowing SHALL reject the relevant operation atomically without panic or truncation. Output shares/NAV SHALL use fixed six places; money SHALL use fixed twelve places. Derived signed net quantities and profit SHALL allow a minus sign; zero SHALL never be negative. Shares times NAV SHALL remain exact at at most twelve places, with no cent rounding.
+
+Internal position Shares SHALL permit zero, distinct from positive input parsing. Fixed-scale representation SHALL be checked before accepting a value: maximum fixed12 money SHALL be `79228162514264337.593543950335`, maximum fixed6 shares/NAV SHALL be `79228162514264337593543.950335`. Current nonnegative addition/subtraction and shares*Nav SHALL use exact coefficient checks rather than trusting library checked arithmetic that may lower scale. A product SHALL reject when its fixed12 coefficient exceeds 96 bits even if a lower-scale approximate representation would fit. Signed netting/profit and actual trading calculations remain later business work.
 
 #### Scenario: Fractional exact payment
 - **WHEN** a purchase of `0.123456` shares executes at unit NAV `1.234567`
@@ -27,6 +37,10 @@ The engine SHALL accept decimal inputs only as strings matching `(?:0|[1-9][0-9]
 #### Scenario: Aggregate overflow
 - **WHEN** individually representable inputs overflow an exact net, aggregate cost, valuation, normalization, or next-opening balance
 - **THEN** the operation returns `numeric_overflow` without partial account/date/record changes or automatic rounding
+
+#### Scenario: Fixed-scale coefficient boundary without rounding
+- **WHEN** maximum fixed6 shares are multiplied by NAV `0.000001` or `0.000002`, or the minimum fixed12 increment is added to maximum money
+- **THEN** the first product equals maximum fixed12 money exactly, the second product and overflowing sum reject, and no implicit rescaling or rounding occurs
 
 ### Requirement: Whole-list intention replacement and per-fund netting
 `set_orders` SHALL replace the entire ordered intention list only after all individual inputs validate. Each intention SHALL contain code, side `buy` or `sell`, and positive fractional shares. Empty lists SHALL cancel intentions. The engine SHALL preserve original ordering and duplicates in the original list, derive signed `buy - sell` net shares per fund in ascending code order, and validate only derived executable operations. Zero nets SHALL produce `no_trade` outcomes without execution or need for NAV. Accepting orders SHALL not promise execution.
