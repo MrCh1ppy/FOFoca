@@ -1,9 +1,9 @@
 ## ADDED Requirements
 
-Adapter-stage note: reports remain unimplemented and both adapters reject report calls while uninitialized; no empty successful report is fabricated. JSON below is the future explicit report export contract, not an in-process call protocol or core ledger representation. Python binding calls use direct objects/exceptions, and Rust callers can link the library directly. Report generation must project the single Rust-owned state; object disposal, CLI quit, and EOF never export automatically.
+Adapter-stage note: reports remain unimplemented and the Python binding rejects report calls while uninitialized; no empty successful report is fabricated. JSON below is the future explicit report export contract, not an in-process call protocol or core ledger representation. Python binding calls use direct objects/exceptions, and Rust callers can link the library directly. Report generation must project the single Rust-owned state; object disposal never exports automatically. There is no binary, CLI, or async runtime.
 
 ### Requirement: Versioned JSON report and assumptions
-The report command SHALL return a JSON object with exactly the following version-1 fields, usable independently of the engine process. It SHALL be available during running and finished initialized sessions and SHALL be a read-only projection. No HTML renderer, web server, database, or additional data fetch SHALL be required. Decimal/date/code fields SHALL follow the session contract; arrays keyed by code SHALL be ascending by code, daily records ascending by date, and source orders SHALL retain submitted order. The report SHALL contain no advanced performance metrics beyond the exact profit defined here.
+The report method SHALL return a JSON-exportable object with exactly the following version-1 fields, usable independently of the session. It SHALL be available during running and finished initialized sessions and SHALL be a read-only projection. No HTML renderer, web server, database, or additional data fetch SHALL be required. Decimal/date/code fields SHALL follow the session contract; arrays keyed by code SHALL be ascending by code, daily records ascending by date, and source orders SHALL retain submitted order. The report SHALL contain no advanced performance metrics beyond the exact profit defined here.
 
 ```text
 ReportV1 = {
@@ -62,7 +62,7 @@ The engine SHALL expose sums matching these components and total_assets SHALL eq
 - **THEN** terminal_account contains that cash claim with its execution/due dates and counts it once without including the sold shares or automatically making cash available
 
 ### Requirement: Successful daily evidence only
-Each successful close SHALL append exactly one DailyRecord with the following exact fields. It SHALL preserve the accepted original intentions, normalized nets, executions, skips, and the day's effective market. Rejected attempts SHALL appear only in protocol responses, not as daily records or a stored failure archive. A retry SHALL never duplicate a successful day. Original submitted_orders SHALL retain the caller's decimal spelling and array ordering, while original_orders SHALL use canonical fixed6 values. They SHALL represent the most recently accepted replacement, not discarded earlier attempts.
+Each successful close SHALL append exactly one DailyRecord with the following exact fields. It SHALL preserve the accepted original intentions, normalized nets, executions, skips, and the day's effective market. Rejected attempts SHALL appear only in call exceptions, not as daily records or a stored failure archive. A retry SHALL never duplicate a successful day. Original submitted_orders SHALL retain the caller's decimal spelling and array ordering, while original_orders SHALL use canonical fixed6 values. They SHALL represent the most recently accepted replacement, not discarded earlier attempts.
 
 ```text
 DailyRecord = {
@@ -77,6 +77,7 @@ DailyRecord = {
            reason: "missing_nav" | "no_trade", provisional: false}],
   closing_account: Account
 }
+OriginalOrder = {code: code, side: "buy" | "sell", shares: fixed6}
 ```
 
 Only non-null NAV entries SHALL appear in the canonical effective market; omitted/null values are equivalent and remain unavailable. Every original code SHALL have one net entry, and each net SHALL have exactly one execution or skip. Executions, nets, and skips SHALL be sorted by code. Zero nets SHALL be `no_trade`; nonzero missing prices SHALL be `missing_nav`. Provisional rejection skips SHALL use the same skip shape with provisional=true and SHALL never be inserted into a report. Fees SHALL not be silently deducted. The report SHALL not require the complete strategy source or a strategy identifier.

@@ -6,25 +6,12 @@ edition = "2024"
 [lib]
 crate-type = ["rlib", "cdylib"]
 
-[[bin]]
-name = "fofoca-engine"
-path = "src/bin/fofoca-engine.rs"
-required-features = ["cli"]
-
-[[test]]
-name = "process"
-required-features = ["cli"]
-
 [features]
 default = []
-cli = ["dep:tokio", "dep:serde", "dep:serde_json", "chrono/serde"]
 python = ["dep:pyo3"]
 
 [dependencies]
-tokio = { version = "1", optional = true, default-features = false, features = ["macros", "rt", "io-std", "io-util"] }
 snafu = "0.8"
-serde = { version = "1", optional = true, features = ["derive"] }
-serde_json = { version = "1", optional = true }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 rust_decimal = { version = "1", default-features = false, features = ["std"] }
 pyo3 = { version = "=0.30.1", optional = true }

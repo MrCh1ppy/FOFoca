@@ -1,27 +1,27 @@
 ## ADDED Requirements
 
-Adapter-stage note: primary PyO3/typed Python construction currently creates only an empty Rust Session; initialize rejects and never creates an account. Default Rust library builds need no Python or wire/JSON types. The optional CLI and Python extension use the same synchronous core; no duplicate Python ledger is permitted. All business requirements below remain unchanged and unimplemented. Decimal-string grammars below describe external input/export contracts, not a requirement that the core store JSON or Python objects; future domain types remain strongly typed Rust values.
+Adapter-stage note: PyO3/typed Python construction currently creates only an empty Rust Session; initialize rejects and never creates an account. Default Rust library builds need no Python or wire/JSON types. The Python extension uses the synchronous core; there is no binary, CLI, async runtime, or duplicate Python ledger. All business requirements below remain unimplemented. Decimal-string grammars below describe external input/export contracts, not a requirement that the core store JSON or Python objects; future domain types remain strongly typed Rust values.
 
 ### Requirement: Single initialized calendar session
-The engine SHALL own one in-memory account with inclusive, fixed `start_date` and `end_date`, `end_date >= start_date`, nonnegative initial cash, and empty confirmed/pending holdings. Dates SHALL be valid calendar dates encoded exactly `YYYY-MM-DD` in years 0001–9999; fund codes SHALL be six ASCII digits. Invalid initialization SHALL leave the session uninitialized, and successful initialization SHALL open start_date exactly once. Repeated initialization SHALL be rejected without mutation. Python SHALL own all strategy decisions and data preparation; the engine SHALL neither fetch data nor impose a D-1 information restriction.
+The engine SHALL own one in-memory account with inclusive, fixed `start_date` and `end_date`, `end_date >= start_date`, nonnegative initial cash, and empty confirmed/pending holdings. Binding dates SHALL be datetime.date values in years 0001–9999, encoded exactly `YYYY-MM-DD` in report exports; fund codes SHALL be six ASCII digits. Invalid initialization SHALL leave the session uninitialized, and successful initialization SHALL open start_date exactly once. Repeated initialization SHALL be rejected without mutation. Python SHALL own all strategy decisions and data preparation; the engine SHALL neither fetch data nor impose a D-1 information restriction.
 
 #### Scenario: Invalid then valid initialization
-- **WHEN** init supplies an impossible date, reversed range, or negative initial cash, followed by a valid init
+- **WHEN** initialize supplies a reversed range or negative initial cash, followed by a valid initialize
 - **THEN** the first request fails without creating an account and the second creates the cash-only account on start_date
 
 #### Scenario: Repeated initialization
-- **WHEN** init is called after a successful init
+- **WHEN** initialize is called after a successful initialize
 - **THEN** it returns `already_initialized` without resetting balances, dates, or records
 
 ### Requirement: Exact decimal arithmetic
-The engine SHALL accept decimal inputs only as strings matching `(?:0|[1-9][0-9]*)(?:\.[0-9]+)?`. Order shares and non-null unit NAV SHALL be positive with at most six supplied fractional digits; initial cash SHALL be nonnegative with at most twelve. JSON numbers, signs, exponent notation, leading zeros, nonfinite values, and excess scale including trailing zeros SHALL be rejected. Every parse, normalization, signed net sum, product, subtraction, aggregate sum, valuation, and output conversion SHALL be checked for exact representation within the `rust_decimal` 96-bit coefficient/scale bound and the field scale. Arithmetic requiring rounding or overflowing SHALL reject the relevant operation atomically without panic or truncation. Output shares/NAV SHALL use fixed six places; money SHALL use fixed twelve places. Derived signed net quantities and profit SHALL allow a minus sign; zero SHALL never be negative. Shares times NAV SHALL remain exact at at most twelve places, with no cent rounding.
+The engine SHALL accept decimal inputs only as strings matching `(?:0|[1-9][0-9]*)(?:\.[0-9]+)?`. Order shares and non-None unit NAV SHALL be positive with at most six supplied fractional digits; initial cash SHALL be nonnegative with at most twelve. Numeric objects, signs, exponent notation, leading zeros, nonfinite values, and excess scale including trailing zeros SHALL be rejected. Every parse, normalization, signed net sum, product, subtraction, aggregate sum, valuation, and output conversion SHALL be checked for exact representation within the `rust_decimal` 96-bit coefficient/scale bound and the field scale. Arithmetic requiring rounding or overflowing SHALL reject the relevant operation atomically without panic or truncation. Output shares/NAV SHALL use fixed six places; money SHALL use fixed twelve places. Derived signed net quantities and profit SHALL allow a minus sign; zero SHALL never be negative. Shares times NAV SHALL remain exact at at most twelve places, with no cent rounding.
 
 #### Scenario: Fractional exact payment
 - **WHEN** a purchase of `0.123456` shares executes at unit NAV `1.234567`
 - **THEN** the cost is exactly `0.152414703552` and no monetary rounding occurs
 
 #### Scenario: Invalid or unrepresentable numbers
-- **WHEN** a request contains JSON float `1.2`, string `NaN`, `1e3`, `01`, order `0`, negative NAV, seven-place shares, thirteen-place cash, or an unrepresentable decimal
+- **WHEN** a call contains float `1.2`, string `NaN`, `1e3`, `01`, order `0`, negative NAV, seven-place shares, thirteen-place cash, or an unrepresentable decimal
 - **THEN** it fails with a structured numeric error without changing the account or replacing orders
 
 #### Scenario: Aggregate overflow
@@ -44,7 +44,7 @@ The engine SHALL accept decimal inputs only as strings matching `(?:0|[1-9][0-9]
 - **THEN** the whole replacement fails and the previous ordered list remains unchanged
 
 ### Requirement: Current-day unit NAV snapshot
-Only `advance_day` SHALL accept `{date, unit_nav}` market input, where unit_nav maps fund codes to positive decimal strings or null. Missing keys and explicit null SHALL both mean unavailable. Wrong date, invalid code, malformed/nonpositive values, extra fields, and duplicate JSON keys SHALL reject input before pinning or mutation. The first valid current-day snapshot SHALL be pinned even if execution subsequently fails. Equality SHALL compare normalized decimal values and treat missing/null entries as equivalent, ignoring object order; a changed effective snapshot SHALL return `market_conflict`. A rejected batch SHALL NOT commit this candidate to the successful-day valuation cache. A successful close SHALL commit all non-null snapshot prices with that day's date. Neither accumulated NAV nor stale NAV SHALL be an execution price.
+Only `advance_day` SHALL accept `{date, unit_nav}` market input, where unit_nav maps fund codes to positive decimal strings or None. Missing keys and explicit None SHALL both mean unavailable. Wrong date, invalid code, malformed/nonpositive values, and extra fields SHALL reject input before pinning or mutation. Python dictionaries supply unique keys; no JSON parser SHALL be required. The first valid current-day snapshot SHALL be pinned even if execution subsequently fails. Equality SHALL compare normalized decimal values and treat missing/None entries as equivalent, ignoring map order; a changed effective snapshot SHALL return `market_conflict`. A rejected batch SHALL NOT commit this candidate to the successful-day valuation cache. A successful close SHALL commit all non-None snapshot prices with that day's date. Neither accumulated NAV nor stale NAV SHALL be an execution price.
 
 #### Scenario: Retry with immutable prices
 - **WHEN** a valid snapshot is pinned by an overspending close, then a retry changes its non-null price
@@ -81,7 +81,7 @@ The engine SHALL compare each executable net sell with opening confirmed shares 
 - **THEN** the rejection changes neither balances nor date nor committed prices, arrival is not repeated, and the eventual success creates exactly one daily record
 
 ### Requirement: Next natural day settlement and terminal boundary
-A successful buy SHALL deduct cash immediately and create pending shares due D+1; a successful sell SHALL deduct confirmed shares immediately and create pending cash due D+1. Every pending item SHALL include its exact expected date, code, amount/shares, and execution date. Pending shares SHALL not be sellable and pending cash SHALL not be spendable before arrival. A successful nonterminal close SHALL clear orders and pinned snapshot, advance exactly one natural day, and apply all due arrivals once before responding. Closing end_date SHALL instead mark `finished`, retain current_date=end_date and pending assets, and perform no extra opening, liquidation, or settlement drain. Finished sessions SHALL permit only account/report/quit; stale/duplicate advances SHALL fail. Unrepresentable D+1 for a trade SHALL reject rather than wrap dates.
+A successful buy SHALL deduct cash immediately and create pending shares due D+1; a successful sell SHALL deduct confirmed shares immediately and create pending cash due D+1. Every pending item SHALL include its exact expected date, code, amount/shares, and execution date. Pending shares SHALL not be sellable and pending cash SHALL not be spendable before arrival. A successful nonterminal close SHALL clear orders and pinned snapshot, advance exactly one natural day, and apply all due arrivals once before returning. Closing end_date SHALL instead mark `finished`, retain current_date=end_date and pending assets, and perform no extra opening, liquidation, or settlement drain. Finished sessions SHALL permit only account/report; stale/duplicate advances SHALL fail. Unrepresentable D+1 for a trade SHALL reject rather than wrap dates.
 
 #### Scenario: Three-day cash and share conservation
 - **WHEN** initial cash is 100 over January 1–3, day 1 buys 10 shares at 2, day 2 sells 4 at 3 after the buy arrives, and day 3 has no trade with NAV 3

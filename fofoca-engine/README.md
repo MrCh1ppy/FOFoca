@@ -1,7 +1,7 @@
 # fofoca-engine (binding skeleton)
 
 Independent edition-2024 Rust library with a **PyO3 extension and thin typed Python
-facade** as the primary entry point. No HTTP, SQLite, persistence, data fetching,
+facade** as the Python entry point. No binary, CLI, async runtime, HTTP, SQLite, persistence, data fetching,
 environment credentials, deployment, or scheduling. Existing applications are
 unchanged. A future local Rust application can directly link this library and
 compose data/report components without Python or a subprocess.
@@ -90,10 +90,8 @@ cp312 wheel imports under 3.14.
   support claim): an earlier attempt with this host's system 3.14.7 failed ordinary
   Python-feature cargo test with `unable to find library -lpython3.14`, although its
   wheel built and imported successfully.
-- `cli` enables optional Tokio (macros/rt/io-std/io-util), serde/JSON, CLI library
-  facade `run`/`CliError`, binary, and process regression test. It uses the **same**
-  core session and no parallel tasks, Arc/Mutex, or separate business state.
-- SNAFU errors belong to their actual modules (session, protocol, cli). The Python
+- There is no `cli` feature, binary target, JSON Lines transport, or Tokio dependency.
+- SNAFU errors belong to their actual modules (currently `session`). The Python
   adapter only converts errors to Python exceptions; it needs no error enum.
 - Chrono and rust_decimal remain the date/exact-arithmetic dependencies for later
   authorized business work; the documentation-only domain modules do no work yet.
@@ -103,36 +101,14 @@ cargo fmt --check --manifest-path fofoca-engine/Cargo.toml
 cargo check --locked --manifest-path fofoca-engine/Cargo.toml
 cargo test --locked --manifest-path fofoca-engine/Cargo.toml
 cargo clippy --locked --manifest-path fofoca-engine/Cargo.toml --all-targets -- -D warnings
-cargo check --locked --manifest-path fofoca-engine/Cargo.toml --features cli
-cargo test --locked --manifest-path fofoca-engine/Cargo.toml --features cli
-cargo clippy --locked --manifest-path fofoca-engine/Cargo.toml --features cli --all-targets -- -D warnings
-PYO3_PYTHON=python3.12 cargo check --locked --manifest-path fofoca-engine/Cargo.toml --features python
-PYO3_PYTHON=python3.12 cargo test --locked --manifest-path fofoca-engine/Cargo.toml --features python
-PYO3_PYTHON=python3.12 cargo clippy --locked --manifest-path fofoca-engine/Cargo.toml --features python --all-targets -- -D warnings
 PYO3_PYTHON=python3.12 cargo check --locked --manifest-path fofoca-engine/Cargo.toml --all-features
 PYO3_PYTHON=python3.12 cargo test --locked --manifest-path fofoca-engine/Cargo.toml --all-features
 PYO3_PYTHON=python3.12 cargo clippy --locked --manifest-path fofoca-engine/Cargo.toml --all-features --all-targets -- -D warnings
 ```
 
-## Optional secondary CLI
-
-```sh
-cargo run --locked --manifest-path fofoca-engine/Cargo.toml --features cli --bin fofoca-engine
-```
-
-The original JSON Lines contract and fourteen real-process Python tests remain.
-The Rust `tests/process.rs` regression invokes `python3.12` explicitly rather than
-the system `python3`, so CLI tests cannot silently use 3.14.
-Only `quit` succeeds with `{}` and flushes before zero exit. Shape-valid `init`
-returns `not_implemented`; other business commands return `not_initialized`.
-Every response has `state: null`, even after repeated init. Request IDs correlate
-only, not idempotency. Unknown fields and recursively duplicated keys fail.
-Invalid/duplicate JSON has null response ID; otherwise a valid ID is recovered.
-Each line, including a blank line or nonempty final unterminated line, receives
-one response and flush. Empty EOF exits silently. Quit ignores subsequent input.
-UTF-8/I/O failures exit nonzero with stderr-only diagnostics. No automatic close,
-settlement, export, or recovery occurs on quit/EOF or Python object disposal.
-The optional CLI is not a required runtime component of the Python package.
+Historical note: the former JSON Lines CLI and its process tests were removed;
+their earlier passing results are not current validation. Python object disposal
+discards memory without automatic close, settlement, export, or recovery.
 
 Business rules in OpenSpec remain the later target: exact bounded decimals,
 natural-day D+1 settlement, no fees/distributions, trusted-author data/strategy,
