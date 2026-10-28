@@ -23,6 +23,8 @@ fn exception(error: SessionError) -> PyErr {
         SessionError::NotImplemented => PyNotImplementedError::new_err(error.to_string()),
         SessionError::NotInitialized => NotInitializedError::new_err(error.to_string()),
         SessionError::AlreadyInitialized => AlreadyInitializedError::new_err(error.to_string()),
+        // Rust-only daily operations are not exposed by this adapter yet.
+        _ => PyRuntimeError::new_err(error.to_string()),
     }
 }
 

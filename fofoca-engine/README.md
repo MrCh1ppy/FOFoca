@@ -1,4 +1,4 @@
-# fofoca-engine (initialization and stateless settlement-core stage)
+# fofoca-engine (Rust daily-session stage)
 
 Independent edition-2024 Rust library with a **PyO3 extension and thin typed Python
 facade** as the Python entry point. No binary, CLI, async runtime, HTTP, SQLite, persistence, data fetching,
@@ -30,7 +30,7 @@ not rounds; money/shares output always has 12/6 places and unsigned zero.
 The Rust core also has a stateless single-day settlement helper,
 `settlement::settle(opening: &Account, current_date, unit_nav, orders)`, with typed
 `Order`/`Side` inputs. It derives checked buy-minus-sell nets by code (zero =
-`no_trade`), skips non-zero nets without today's NAV before any sufficiency check,
+`no_trade`), rejects non-zero nets without today's NAV before sufficiency checks for that code,
 checks sells against opening confirmed shares, and checks the aggregate buy cost
 once against opening cash without recycling sale proceeds. Any issue returns a
 structured rejection containing the original orders, derived nets, provisional
@@ -39,14 +39,44 @@ successful candidate applies only that day's trade changes: buys deduct cash and
 create D+1 pending shares, sells deduct confirmed shares and create D+1 pending
 cash, and the candidate is revalued exactly with a checked component/total
 partition. D+1 outside business years 1–9999 rejects. There is no f64 or rounding.
-This helper is **not exposed through Python and not committed by `Session`**;
-price pinning, order replacement, next-opening arrivals, records, reports, and
-daily advancement remain later work.
+This helper is **not exposed through Python**. Rust `Session::advance_day` uses it
+after working-copy arrivals and commits only a successful candidate.
+
+### Rust daily transition
+
+`Session::advance_day(orders: &[Order], market: &MarketSnapshot)` returns
+`Result<AdvanceOutcome, SessionError>`. Orders are per-call borrowed input, never
+cached or appended to a later call. Empty orders close a no-trade day.
+`MarketSnapshot::new(date, BTreeMap<Code, Option<Nav>>)` validates the year range;
+`Code` and positive `Nav` constructors enforce code/price validity. The session
+rejects a date other than its current date before pinning. Normalized equality
+ignores insertion order, decimal spelling, and explicit `None` entries.
+
+The first valid current-date market is pinned even on business rejection. Retry
+with repaired orders and the same effective market; a different market returns
+`MarketConflict` without evaluating orders. A successful close clears the pin.
+The pin is visible through detached `Snapshot::snapshot_pinned` but is not a
+committed valuation. No order queue or `set_orders` exists in the Rust core.
+
+Due pending buys and cash arrive on a disposable opening copy before trading,
+including on no-NAV days. Settlement uses only opening cash, never same-day sale
+proceeds. A non-zero net missing a closing NAV produces `Issue::MissingClosingNav`
+and rejects the entire batch; zero nets require no NAV. Rejections retain original
+orders, derived nets, provisional skips, and independent issues. No arrival,
+trade, valuation, date, or last-close change commits on rejection.
+
+`AdvanceOutcome::Advanced` contains the closed date, executions, skips, detached
+account, and finished flag. Successful closes set `last_closed_date` and advance
+one natural day, or mark `Status::Finished` at the inclusive end date without
+computing its successor. Terminal pending assets remain; there is no drain or
+liquidation. Further advance calls return `SessionError::Finished`; account
+queries still work. An executable trade on 9999-12-31 rejects because its D+1
+cannot fit the supported years; an empty close can finish that date.
 
 `account() -> Snapshot` returns an independent nested Python dict/list projection,
 not a JSON envelope. Its exact top-level keys are `status`, `start_date`, `end_date`,
 `current_date`, `last_closed_date`, `snapshot_pinned`, `orders`, `account`.
-At this stage status is `running`, current_date is start_date, last_closed_date is
+For the Python initialization-only surface, status is `running`, current_date is start_date, last_closed_date is
 None, snapshot_pinned is False, and orders is empty. The nested `Account` has
 `valuation_date` (start_date), `cash`, `holdings`, `pending_buys`, `pending_cash`,
 `confirmed_value`, `pending_buy_value`, `pending_cash_value`, `total_assets`.
@@ -60,9 +90,9 @@ ValueError; coefficient/arithmetic overflow raises OverflowError. Native
 Before initialization account/order/day/report calls raise NotInitializedError.
 After initialization, account succeeds but `set_orders`, `advance_day`, and `report`
 still raise NotImplementedError, never return fake success. Python nested order/market
-validation, Session order/day wiring, committed daily settlement and arrivals,
-price pinning caches, records, and JSON report generation are not implemented.
-The Rust stateless settlement helper above is not yet reachable from Python.
+validation and result conversion, records, and JSON report generation are not
+implemented. Rust daily settlement, arrivals, and pinning are not reachable from
+Python; its business methods remain explicitly unimplemented.
 
 The thin wrapper exports Snapshot/Account/Holding/PendingBuy/PendingCash TypedDicts,
 Order/Market shapes, exceptions, a private native stub, and `py.typed`. It retains
@@ -139,11 +169,11 @@ cp312 wheel imports under 3.14.
   Python-feature cargo test with `unable to find library -lpython3.14`, although its
   wheel built and imported successfully.
 - There is no `cli` feature, binary target, JSON Lines transport, or Tokio dependency.
-- SNAFU errors belong to their actual modules (`decimal`, `model`, `session`). The Python
+- SNAFU errors belong to their actual modules (`decimal`, `model`, `market`, `session`). The Python
   adapter only converts errors to Python exceptions; it needs no error enum.
 - Chrono and rust_decimal back validated dates and exact fixed-scale values.
-  The `settlement` module is a stateless Rust candidate helper with no Session
-  commit; `report` remains documentation-only and Session owns state.
+  The `settlement` module is a stateless Rust candidate helper; Session owns the
+  atomic commit and `report` remains documentation-only.
 
 ```sh
 cargo fmt --check --manifest-path fofoca-engine/Cargo.toml
@@ -159,10 +189,6 @@ Historical note: the former JSON Lines CLI and its process tests were removed;
 their earlier passing results are not current validation. Python object disposal
 discards memory without automatic close, settlement, export, or recovery.
 
-Remaining business rules in OpenSpec are the later target: Session-committed
-natural-day D+1 settlement and arrivals, no fees/distributions, trusted-author
-data/strategy, fixed candidate versus committed market, stale valuation, and
-terminal pending assets retained without liquidation. The stateless settlement
-core already computes D+1 pending candidates and stale revaluation, but it does
-not advance, arrive, pin, record, or commit. This stage does not implement the
-remaining rules or apply the full change.
+This stage implements Rust natural-day D+1 settlement, arrivals, fixed-market
+retries, stale valuation, and terminal pending retention. Python business
+bindings, daily records, reports, persistence, and network access remain deferred.

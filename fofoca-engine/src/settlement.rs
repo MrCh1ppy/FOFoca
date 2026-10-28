@@ -1,10 +1,10 @@
 //! Stateless single-day settlement candidate calculation.
 //!
 //! The opening account is borrowed and never mutated. A successful outcome owns a
-//! candidate account plus the day's executions and missing-NAV skips; a rejected
+//! candidate account plus the day's executions; a rejected
 //! outcome owns the original orders, derived nets, provisional skips, and every
-//! independently discoverable issue. Calendar advancement, arrivals, order
-//! replacement, price caching, records, and session commits remain elsewhere.
+//! independently discoverable issue. Calendar advancement, arrivals, price
+//! caching, records, and session commits remain elsewhere.
 use std::{cmp::Ordering, collections::BTreeMap};
 
 use chrono::{Datelike, NaiveDate};
@@ -70,6 +70,9 @@ pub struct Execution {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Issue {
+    MissingClosingNav {
+        code: Code,
+    },
     Oversell {
         code: Code,
         requested: Shares,
@@ -133,8 +136,8 @@ struct PendingOp {
 /// Compute one day's closing candidate from the opening account.
 ///
 /// `unit_nav` maps fund codes to the current day's optional unit NAV; a missing
-/// key and `None` are equivalent. Non-zero nets without a price become
-/// `missing_nav` skips before any cash or confirmed-share check. Executable sells
+/// key and `None` are equivalent. Non-zero nets without a price reject the batch
+/// before any cash or confirmed-share check for that code. Executable sells
 /// are checked against opening confirmed shares and all executable buy costs are
 /// checked once against opening cash. Any issue rejects the whole batch.
 pub fn settle(
@@ -154,6 +157,9 @@ pub fn settle(
             NetShares::NoTrade => continue,
         };
         let Some(nav) = unit_nav.get(&derived.code).and_then(|nav| *nav) else {
+            issues.push(Issue::MissingClosingNav {
+                code: derived.code.clone(),
+            });
             skips.push(Skip {
                 code: derived.code.clone(),
                 net: derived.net,
@@ -439,7 +445,7 @@ fn sum_money(mut values: impl Iterator<Item = Money>) -> Result<Money, ()> {
     })
 }
 
-fn derive_nets(orders: &[Order]) -> (Vec<DerivedNet>, Vec<Issue>) {
+pub(crate) fn derive_nets(orders: &[Order]) -> (Vec<DerivedNet>, Vec<Issue>) {
     let mut nets = BTreeMap::new();
     let mut issues = Vec::new();
     for order in orders {
@@ -652,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_nav_skips_before_oversell_and_cash_checks() {
+    fn missing_nav_rejects_before_oversell_and_cash_checks() {
         let day = date(2026, 1, 1);
         let opening = account(day, money("100"), Vec::new(), Vec::new(), Vec::new());
         let orders = vec![
@@ -660,21 +666,31 @@ mod tests {
             order("000002", Side::Buy, "1000000"),
         ];
         let outcome = settle(&opening, day, &BTreeMap::new(), &orders);
-        let candidate = outcome.candidate().unwrap();
+        let rejection = outcome.rejection().unwrap();
 
-        assert!(candidate.executions.is_empty());
-        assert_eq!(candidate.skips.len(), 2);
-        assert_eq!(candidate.skips[0].code, code("000001"));
-        assert_eq!(candidate.skips[0].net, NetShares::Sell(shares("1")));
-        assert_eq!(candidate.skips[1].code, code("000002"));
-        assert_eq!(candidate.skips[1].net, NetShares::Buy(shares("1000000")));
+        assert_eq!(
+            rejection.issues,
+            vec![
+                Issue::MissingClosingNav {
+                    code: code("000001")
+                },
+                Issue::MissingClosingNav {
+                    code: code("000002")
+                },
+            ]
+        );
+        assert_eq!(rejection.skips.len(), 2);
+        assert_eq!(rejection.skips[0].code, code("000001"));
+        assert_eq!(rejection.skips[0].net, NetShares::Sell(shares("1")));
+        assert_eq!(rejection.skips[1].code, code("000002"));
+        assert_eq!(rejection.skips[1].net, NetShares::Buy(shares("1000000")));
         assert!(
-            candidate
+            rejection
                 .skips
                 .iter()
                 .all(|skip| skip.reason == SkipReason::MissingNav)
         );
-        assert_eq!(candidate.account, opening);
+        assert_eq!(opening.cash, money("100"));
     }
 
     #[test]
