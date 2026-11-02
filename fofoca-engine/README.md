@@ -39,7 +39,7 @@ successful candidate applies only that day's trade changes: buys deduct cash and
 create D+1 pending shares, sells deduct confirmed shares and create D+1 pending
 cash, and the candidate is revalued exactly with a checked component/total
 partition. D+1 outside business years 1–9999 rejects. There is no f64 or rounding.
-This helper is **not exposed through Python**. Rust `Session::advance_day` uses it
+This helper is not exposed directly through Python. Rust `Session::advance_day` uses it
 after working-copy arrivals and commits only a successful candidate.
 
 ### Rust daily transition
@@ -76,26 +76,61 @@ cannot fit the supported years; an empty close can finish that date.
 `account() -> Snapshot` returns an independent nested Python dict/list projection,
 not a JSON envelope. Its exact top-level keys are `status`, `start_date`, `end_date`,
 `current_date`, `last_closed_date`, `snapshot_pinned`, `orders`, `account`.
-For the Python initialization-only surface, status is `running`, current_date is start_date, last_closed_date is
-None, snapshot_pinned is False, and orders is empty. The nested `Account` has
-`valuation_date` (start_date), `cash`, `holdings`, `pending_buys`, `pending_cash`,
+Status is `running` or `finished`; current_date comes only from Rust,
+last_closed_date is None until the first close, and snapshot_pinned reflects a
+pending retry. The compatibility `orders` list is always empty; no orders are retained.
+The nested `Account` has
+`valuation_date`, `cash`, `holdings`, `pending_buys`, `pending_cash`,
 `confirmed_value`, `pending_buy_value`, `pending_cash_value`, `total_assets`.
-All lists are empty, component values are `0.000000000000`, and total_assets equals
-cash. All dates are `datetime.date`, all money values are fixed12 strings.
+Initially all lists are empty, component values are `0.000000000000`, and total_assets equals
+cash. All dates are `datetime.date`, all money values are fixed12 strings;
+shares and NAVs are fixed6 strings.
 Modifying any returned object cannot change the native session.
 
-Wrong input types raise TypeError; date ranges, decimal grammar/scale raise
-ValueError; coefficient/arithmetic overflow raises OverflowError. Native
-`NotInitializedError` and `AlreadyInitializedError` both derive from RuntimeError.
-Before initialization account/order/day/report calls raise NotInitializedError.
-After initialization, account succeeds but `set_orders`, `advance_day`, and `report`
-still raise NotImplementedError, never return fake success. Python nested order/market
-validation and result conversion, records, and JSON report generation are not
-implemented. Rust daily settlement, arrivals, and pinning are not reachable from
-Python; its business methods remain explicitly unimplemented.
+### Python daily transition
+
+`advance_day(orders, market) -> Advanced | Rejected` accepts a **list** of order
+mappings `{code, side, shares}` and a NAV **mapping** `code -> str | None`.
+Codes contain exactly six ASCII digits, sides are exactly `buy` or `sell`, and
+shares and NAV strings are strictly positive with at most six supplied fractional
+digits, using the decimal grammar above. All order fields are required. Extra
+order fields are ignored. The entire order list and market are parsed before
+calling Rust; malformed late entries cannot pin the market or change state.
+No Python date is submitted: the adapter uses the current Rust session snapshot.
+Missing market keys and `None` are equivalent; both mean no current closing NAV.
+`advance_day([], {})` closes a no-trade day, including arrivals and stale valuation.
+There is no `set_orders`, hidden order queue, or one-argument daily API.
+
+Results are newly allocated dicts/lists at every level:
+
+- `Advanced`: `status="advanced"`, `closed_date`, `executions`, `skips`, `account`,
+  `finished`. Executions contain `code`, `side`, `shares`, `unit_nav`, `amount`,
+  `execution_date`, `due_date`.
+- `Rejected`: `status="rejected"`, original `orders` (canonical decimal strings),
+  `nets`, `skips`, `issues`. Nets contain `code`, `side` (`buy`, `sell`, or None
+  for zero net), and `shares`. Skips add `reason="missing_nav"` to the same shape.
+- Issues use a `kind` discriminator: `missing_closing_nav` adds `code`;
+  `oversell` adds `code`, `requested`, `confirmed`; `insufficient_cash` adds
+  `required`, `available`; `arithmetic_overflow` adds nullable `code`;
+  `due_date_overflow` has no additional fields. Arithmetic/date overflow during
+  Rust settlement is a business rejection, not an input exception.
+
+Rejections preserve the account and date but pin the normalized effective market.
+Repair orders and retry with that same market; changing the market raises
+`MarketConflictError`. An unpriced nonzero order cannot be repaired by adding a
+price to the pinned day: remove or net out the order instead.
+
+Wrong container/field types and missing order fields raise `TypeError`; invalid
+codes, sides, date ranges, decimal grammar/scale/positivity raise `ValueError`;
+input coefficient overflow raises `OverflowError`. Native `NotInitializedError`,
+`AlreadyInitializedError`, `FinishedError`, and `MarketConflictError` derive from
+`RuntimeError`. Rust market validation errors map to `ValueError` (wrong dates
+cannot be supplied through this Python API). Before initialization valid
+account/day/report calls raise `NotInitializedError`. After initialization only
+`report()` still raises `NotImplementedError`; records/report business remain deferred.
 
 The thin wrapper exports Snapshot/Account/Holding/PendingBuy/PendingCash TypedDicts,
-Order/Market shapes, exceptions, a private native stub, and `py.typed`. It retains
+Order/Market and discriminated outcome/issue shapes, exceptions, a private native stub, and `py.typed`. It retains
 only the native handle: no Python ledger, JSON round trip, subprocess, or Tokio.
 
 ```python
@@ -108,6 +143,12 @@ snapshot = session.account()
 assert snapshot["account"]["total_assets"] == "100.000000000000"
 snapshot["account"]["cash"] = "0"  # Detached copy, not a transaction.
 assert session.account()["account"]["cash"] == "100.000000000000"
+outcome = session.advance_day(
+    [{"code": "000001", "side": "buy", "shares": "1"}],
+    {"000001": "1.234567"},
+)
+assert outcome["status"] == "advanced"
+assert outcome["closed_date"] == date(2026, 1, 1)
 ```
 
 Rust callers use `Config::parse(NaiveDate, NaiveDate, &str)` (or `Config::new`
@@ -149,7 +190,9 @@ python3.12 -m venv /tmp/opencode/fofoca-engine-test-312
 The installed-wheel suite checks native import, independent objects, actual
 exceptions and type failures, typing artifacts, exact snapshot shape, decimal/date
 bounds, invalid-then-valid and repeated initialization, detached nested copies,
-and explicitly unimplemented trading/report methods. An audit hook rejects child-process
+four-day buy/arrival/sell/arrival, empty closes, business rejection, repaired retries,
+market conflicts, finished sessions, strict nested validation without partial changes,
+and the still-unimplemented report method. An audit hook rejects child-process
 operations before import and PATH is empty throughout. No test replaces the
 extension or engine with mocks. The wheel contains `fofoca_engine._native` and
 `python/fofoca_engine/`. Historical note: an earlier cp314 wheel was built and
@@ -190,5 +233,5 @@ their earlier passing results are not current validation. Python object disposal
 discards memory without automatic close, settlement, export, or recovery.
 
 This stage implements Rust natural-day D+1 settlement, arrivals, fixed-market
-retries, stale valuation, and terminal pending retention. Python business
-bindings, daily records, reports, persistence, and network access remain deferred.
+retries, stale valuation, terminal pending retention, and Python daily bindings.
+Daily records, reports, persistence, and network access remain deferred.
