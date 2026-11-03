@@ -3,8 +3,8 @@ from collections.abc import Mapping
 from datetime import date
 from typing import Literal, TypedDict
 
-from . import _native
-from ._native import AlreadyInitializedError, FinishedError, MarketConflictError, NotInitializedError
+from .. import _native
+from .._native import AlreadyInitializedError, FinishedError, MarketConflictError, NotInitializedError
 
 __all__ = [
     "BacktestSession", "NotInitializedError", "AlreadyInitializedError",

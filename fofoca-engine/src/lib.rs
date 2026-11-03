@@ -5,7 +5,7 @@ pub mod decimal;
 pub mod market;
 pub mod model;
 #[cfg(feature = "python")]
-mod python;
+pub mod python;
 mod report;
 mod session;
 pub mod settlement;

@@ -1,7 +1,8 @@
 # fofoca-engine (Rust daily-session stage)
 
-Independent edition-2024 Rust library with a **PyO3 extension and thin typed Python
-facade** as the Python entry point. No binary, CLI, async runtime, HTTP, SQLite, persistence, data fetching,
+Edition-2024 Rust library, now an in-place member of the `fofoca-local` workspace,
+with a **PyO3 adapter and thin typed Python facade** as the Python entry point.
+The engine itself has no binary, CLI, async runtime, HTTP, SQLite, persistence, data fetching,
 environment credentials, deployment, or scheduling. Existing applications are
 unchanged. A future local Rust application can directly link this library and
 compose data/report components without Python or a subprocess.
@@ -135,7 +136,7 @@ only the native handle: no Python ledger, JSON round trip, subprocess, or Tokio.
 
 ```python
 from datetime import date
-from fofoca_engine import BacktestSession
+from fofoca_local.engine import BacktestSession  # fofoca_engine remains a compatibility import
 
 session = BacktestSession()
 session.initialize(date(2026, 1, 1), date(2026, 1, 3), "100")
@@ -161,31 +162,15 @@ but no transaction mutation API. Core types depend on neither PyO3 nor serde/JSO
 
 ## Packaging and real-wheel validation (repository root)
 
-PyO3 is pinned to stable **0.30.1**. CPython **3.12** is the sole currently
-supported and validated baseline (`requires-python = ">=3.12,<3.13"`). Maturin
->=1.9.4,<2 handles extension linking; do **not** enable PyO3's deprecated
-`extension-module` feature. Build version-specific, non-abi3 wheels; a wheel is
-not promised to import under another interpreter version. Build tools and test
-installation live in separate temporary venvs, never the system interpreter.
-Use fresh directories if these example names are already occupied.
-
-`fofoca-engine/.python-version` (`3.12`) is a hint for version managers only.
-Cargo/PyO3 does not read it, so every Python-feature command below sets
-`PYO3_PYTHON=python3.12` explicitly.
-
-```sh
-ls /tmp/opencode
-python3.12 -m venv /tmp/opencode/fofoca-engine-build-312
-/tmp/opencode/fofoca-engine-build-312/bin/python -m pip install 'maturin>=1.9.4,<2'
-PYO3_PYTHON=python3.12 /tmp/opencode/fofoca-engine-build-312/bin/maturin build --locked --release \
-  --manifest-path fofoca-engine/Cargo.toml \
-  --interpreter /tmp/opencode/fofoca-engine-build-312/bin/python \
-  --out /tmp/opencode/fofoca-engine-wheels-312
-python3.12 -m venv /tmp/opencode/fofoca-engine-test-312
-/tmp/opencode/fofoca-engine-test-312/bin/python -m pip install --force-reinstall \
-  /tmp/opencode/fofoca-engine-wheels-312/*.whl
-/tmp/opencode/fofoca-engine-test-312/bin/python -I fofoca-engine/tests/wheel_contract.py
-```
+Build/install commands and centralized dependency policy now live in
+[`fofoca-local/README.md`](../fofoca-local/README.md). Use only
+`fofoca-local/pyproject.toml` and `fofoca-local/Cargo.lock`; the standalone engine
+wheel entry point and lockfile have been retired after validating the replacement.
+The unified CPython **3.12** wheel exports `fofoca_local.engine` and a compatibility
+`fofoca_engine` package, with identical native classes and exceptions. Both imports
+use the single `fofoca_local._native` extension; no engine implementation is copied.
+The original `tests/wheel_contract.py` remains unchanged and is reused by the local
+installed-wheel suite.
 
 The installed-wheel suite checks native import, independent objects, actual
 exceptions and type failures, typing artifacts, exact snapshot shape, decimal/date
@@ -194,8 +179,8 @@ four-day buy/arrival/sell/arrival, empty closes, business rejection, repaired re
 market conflicts, finished sessions, strict nested validation without partial changes,
 and the still-unimplemented report method. An audit hook rejects child-process
 operations before import and PATH is empty throughout. No test replaces the
-extension or engine with mocks. The wheel contains `fofoca_engine._native` and
-`python/fofoca_engine/`. Historical note: an earlier cp314 wheel was built and
+extension or engine with mocks. The compatibility `fofoca_engine._native` module
+aliases the new native module. Historical note: an earlier cp314 wheel was built and
 its eight tests passed on this host; because the wheel is version-specific and
 non-abi3, that result is retained only as history and does not promise that the
 cp312 wheel imports under 3.14.
@@ -218,15 +203,9 @@ cp312 wheel imports under 3.14.
   The `settlement` module is a stateless Rust candidate helper; Session owns the
   atomic commit and `report` remains documentation-only.
 
-```sh
-cargo fmt --check --manifest-path fofoca-engine/Cargo.toml
-cargo check --locked --manifest-path fofoca-engine/Cargo.toml
-cargo test --locked --manifest-path fofoca-engine/Cargo.toml
-cargo clippy --locked --manifest-path fofoca-engine/Cargo.toml --all-targets -- -D warnings
-PYO3_PYTHON=python3.12 cargo check --locked --manifest-path fofoca-engine/Cargo.toml --all-features
-PYO3_PYTHON=python3.12 cargo test --locked --manifest-path fofoca-engine/Cargo.toml --all-features
-PYO3_PYTHON=python3.12 cargo clippy --locked --manifest-path fofoca-engine/Cargo.toml --all-features --all-targets -- -D warnings
-```
+Use the workspace validation commands in the local README. For an engine-only
+Rust check use `cargo check --locked --manifest-path fofoca-local/Cargo.toml -p fofoca-engine`;
+it still resolves from the authoritative local workspace lockfile.
 
 Historical note: the former JSON Lines CLI and its process tests were removed;
 their earlier passing results are not current validation. Python object disposal

@@ -2,6 +2,7 @@
 name = "fofoca-engine"
 version = "0.1.0"
 edition = "2024"
+workspace = "../fofoca-local"
 
 [lib]
 crate-type = ["rlib", "cdylib"]
@@ -11,7 +12,7 @@ default = []
 python = ["dep:pyo3"]
 
 [dependencies]
-snafu = "0.8"
-chrono = { version = "0.4", default-features = false, features = ["std"] }
-rust_decimal = { version = "1", default-features = false, features = ["std"] }
-pyo3 = { version = "=0.30.1", optional = true }
+snafu.workspace = true
+chrono.workspace = true
+rust_decimal.workspace = true
+pyo3 = { workspace = true, optional = true }

@@ -360,8 +360,7 @@ impl PythonSession {
     }
 }
 
-#[pymodule]
-fn _native(module: &Bound<'_, PyModule>) -> PyResult<()> {
+pub fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PythonSession>()?;
     module.add("FinishedError", module.py().get_type::<FinishedError>())?;
     module.add(
